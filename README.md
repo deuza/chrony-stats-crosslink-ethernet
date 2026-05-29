@@ -19,5 +19,5 @@ My configuration :
        GPS/PPS    GPS/PPS
        (HAT)      (HAT)
 
-A big thank you to TheHuman00 for the original idea
+A big thank you to [TheHuman00](https://github.com/TheHuman00/) for the original idea
 His repository for more “standard” use is available here: [https://github.com/TheHuman00/chrony-stats/](https://github.com/TheHuman00/chrony-stats/)
