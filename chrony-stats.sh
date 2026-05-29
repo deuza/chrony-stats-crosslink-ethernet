@@ -1,0 +1,869 @@
+#!/bin/bash
+# --- Exit on error, unset variables, pipeline errors ------------------------
+set -euo pipefail
+
+####################### Configuration ######################
+
+ENABLE_NETWORK_STATS="yes" ## Enable or disable network statistics generation using vnStat
+INTERFACES=("wlan0" "eth0") ## Network interfaces to monitor (bash array). Order = display order in HTML.
+
+PAGE_TITLE="Network Traffic and Chrony Statistics for ${INTERFACES[*]}"
+OUTPUT_DIR="/var/www/html/chrony-network-stats" ## Output directory for HTML and images
+HTML_FILENAME="index.html" ## Output HTML file name
+
+RRD_DIR="/var/lib/chrony-rrd"
+RRD_FILE="$RRD_DIR/chrony.rrd" ## RRD file for storing chrony statistics
+
+ENABLE_LOGGING="no" ## Enable or disable logging to a file
+LOG_FILE="/var/log/chrony-network-stats.log"
+
+AUTO_REFRESH_SECONDS=0 ## Auto-refresh interval in seconds (0 = disabled, e.g., 300 for 5 minutes)
+GITHUB_REPO_LINK_SHOW="no" ## You can display the link to the repo 'chrony-stats' in the HTML footer | Not required | Default: no
+
+
+###### Advanced Configuration ######
+
+CHRONY_ALLOW_DNS_LOOKUP="no" ##  Disabled by default to avoid DNS lookups. Set to "yes" for more readable output (hostnames instead of IPs)
+DISPLAY_PRESET="default" # Preset for large screens. Options: default | 2k | 4k
+
+TIMEOUT_SECONDS=5
+SERVER_STATS_UPPER_LIMIT=100000 ## When chrony restarts, it generate abnormally high values (e.g., 12M) | This filters out values above the threshold
+##############################################################
+
+WIDTH=800   ## These graph sizes are changing with DISPLAY_PRESET
+HEIGHT=300  ##
+
+log_message() {
+    local level="$1"
+    local message="$2"
+    if [[ "$ENABLE_LOGGING" == "yes" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $message" >> "$LOG_FILE"
+    fi
+        echo "[$level] $message"
+}
+
+configure_display_preset() {
+    local preset="${DISPLAY_PRESET,,}"
+    local scale_pct=100
+    local container_px=1400
+    local font_px=16
+
+    case "$preset" in
+        1080p|1080|default)
+            scale_pct=100; container_px=1400; font_px=16 ;;
+        2k|1440p|qhd)
+            scale_pct=135; container_px=2000; font_px=18 ;;
+        4k|2160p|uhd)
+            scale_pct=170; container_px=2600; font_px=20 ;;
+        *)
+            scale_pct=100; container_px=1400; font_px=16 ;;
+    esac
+
+    WIDTH=$(( WIDTH * scale_pct / 100 ))
+    HEIGHT=$(( HEIGHT * scale_pct / 100 ))
+
+    CSS_CUSTOM_ROOT=$(cat <<EOF
+:root {
+    --container-max: ${container_px}px;
+    --font-size-base: ${font_px}px;
+}
+EOF
+)
+
+    log_message "INFO" "Preset '${DISPLAY_PRESET}' -> graph ${WIDTH}x${HEIGHT}, container ${container_px}px, font ${font_px}px"
+}
+
+validate_numeric() {
+    local value="$1"
+    local name="$2"
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        log_message "ERROR" "Invalid $name: $value. Must be numeric."
+        exit 1
+    fi
+}
+
+check_commands() {
+    local commands=("rrdtool" "chronyc" "timeout")
+
+    if [[ "$ENABLE_NETWORK_STATS" == "yes" ]]; then
+        commands+=("vnstati")
+    fi
+
+    for cmd in "${commands[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            log_message "ERROR" "Command '$cmd' not found in PATH."
+            exit 1
+        fi
+    done
+}
+
+setup_directories() {
+    log_message "INFO" "Checking and preparing directories..."
+    for dir in "$OUTPUT_DIR" "$RRD_DIR" "$OUTPUT_DIR/img"; do
+        mkdir -p "$dir" || {
+            log_message "ERROR" "Failed to create directory: $dir"
+            exit 1
+        }
+        if [ ! -w "$dir" ]; then
+            log_message "ERROR" "Directory '$dir' is not writable."
+            exit 1
+        fi
+    done
+}
+
+generate_vnstat_images() {
+    if [[ "$ENABLE_NETWORK_STATS" != "yes" ]]; then
+        log_message "INFO" "Network stats disabled, skipping vnStat image generation..."
+        return 0
+    fi
+
+    local modes=("s" "d" "t" "h" "m" "y")
+    for iface in "${INTERFACES[@]}"; do
+        log_message "INFO" "Generating vnStat images for interface '$iface'..."
+        for mode in "${modes[@]}"; do
+            vnstati -"$mode" -i "$iface" -o "$OUTPUT_DIR/img/vnstat_${iface}_${mode}.png" || {
+                log_message "ERROR" "Failed to generate vnstat image for interface $iface mode $mode. Check INTERFACES=() configuration and 'vnstat --iflist'."
+                exit 1
+            }
+        done
+    done
+}
+
+collect_chrony_data() {
+    log_message "INFO" "Collecting Chrony data..."
+
+    local CHRONYC_OPTS=""
+    if [[ "$CHRONY_ALLOW_DNS_LOOKUP" == "no" ]]; then
+        CHRONYC_OPTS="-n"
+        log_message "INFO" "Using chronyc -n option to prevent DNS lookups"
+    fi
+
+    get_html() {
+        timeout "$TIMEOUT_SECONDS"s chronyc $CHRONYC_OPTS "$1" -v 2>&1 | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g' || {
+            log_message "ERROR" "Failed to collect chronyc $1 data"
+            return 1
+        }
+    }
+
+    RAW_TRACKING=$(timeout "$TIMEOUT_SECONDS"s chronyc $CHRONYC_OPTS tracking) || {
+        log_message "ERROR" "Failed to collect chronyc tracking data"
+        exit 1
+    }
+    CHRONYC_TRACKING_HTML=$(echo "$RAW_TRACKING" | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g')
+    CHRONYC_SOURCES=$(get_html sources) || exit 1
+    CHRONYC_SOURCESTATS=$(get_html sourcestats) || exit 1
+    CHRONYC_SELECTDATA=$(get_html selectdata) || exit 1
+}
+
+extract_chronyc_values() {
+    extract_val() {
+        echo "$RAW_TRACKING" | awk "/$1/ {print \$($2)}" | grep -E '^[-+]?[0-9.]+$' || echo "U"
+    }
+
+    OFFSET=$(extract_val "Last offset" "NF-1")
+
+    local systime_line
+    systime_line=$(echo "$RAW_TRACKING" | grep "System time") || true
+    if [[ -n "$systime_line" ]]; then
+        local value
+        value=$(echo "$systime_line" | awk '{print $4}')
+        if [[ "$systime_line" == *"slow"* ]]; then
+            SYSTIME="-$value"
+        else
+            SYSTIME="$value"
+        fi
+    else
+        SYSTIME="U"
+    fi
+
+    FREQ=$(extract_val "Frequency" "NF-2")
+    RESID_FREQ=$(extract_val "Residual freq" "NF-1")
+    SKEW=$(extract_val "Skew" "NF-1")
+    DELAY=$(extract_val "Root delay" "NF-1")
+    DISPERSION=$(extract_val "Root dispersion" "NF-1")
+    STRATUM=$(extract_val "Stratum" "3")
+    RMS_OFFSET=$(extract_val "RMS offset" "NF-1")
+    UPDATE_INTERVAL=$(extract_val "Update interval" "NF-1")
+
+    local CHRONYC_OPTS=""
+    if [[ "$CHRONY_ALLOW_DNS_LOOKUP" == "no" ]]; then
+        CHRONYC_OPTS="-n"
+    fi
+
+    RAW_STATS=$(LC_ALL=C chronyc $CHRONYC_OPTS serverstats) || {
+        log_message "ERROR" "Failed to collect chronyc serverstats"
+        exit 1
+    }
+    get_stat() {
+        echo "$RAW_STATS" | awk -F'[[:space:]]*:[[:space:]]*' "/$1/ {print \$2}" | grep -E '^[0-9]+$' || echo "U"
+    }
+    PKTS_RECV=$(get_stat "NTP packets received")
+    PKTS_DROP=$(get_stat "NTP packets dropped")
+    CMD_RECV=$(get_stat "Command packets received")
+    CMD_DROP=$(get_stat "Command packets dropped")
+    LOG_DROP=$(get_stat "Client log records dropped")
+    NTS_KE_ACC=$(get_stat "NTS-KE connections accepted")
+    NTS_KE_DROP=$(get_stat "NTS-KE connections dropped")
+    AUTH_PKTS=$(get_stat "Authenticated NTP packets")
+    INTERLEAVED=$(get_stat "Interleaved NTP packets")
+    TS_HELD=$(get_stat "NTP timestamps held")
+}
+
+create_rrd_database() {
+    if [ ! -f "$RRD_FILE" ]; then
+        log_message "INFO" "Creating new RRD file: $RRD_FILE"
+        LC_ALL=C rrdtool create "$RRD_FILE" --step 300 \
+            DS:offset:GAUGE:600:U:U DS:frequency:GAUGE:600:U:U DS:resid_freq:GAUGE:600:U:U DS:skew:GAUGE:600:U:U \
+            DS:delay:GAUGE:600:U:U DS:dispersion:GAUGE:600:U:U DS:stratum:GAUGE:600:0:16 \
+            DS:systime:GAUGE:600:U:U \
+            DS:pkts_recv:COUNTER:600:0:U DS:pkts_drop:COUNTER:600:0:U DS:cmd_recv:COUNTER:600:0:U \
+            DS:cmd_drop:COUNTER:600:0:U DS:log_drop:COUNTER:600:0:U DS:nts_ke_acc:COUNTER:600:0:U \
+            DS:nts_ke_drop:COUNTER:600:0:U DS:auth_pkts:COUNTER:600:0:U DS:interleaved:COUNTER:600:0:U \
+            DS:ts_held:GAUGE:600:0:U \
+            DS:rms_offset:GAUGE:600:U:U DS:update_interval:GAUGE:600:0:U \
+            RRA:AVERAGE:0.5:1:576 RRA:AVERAGE:0.5:6:672 RRA:AVERAGE:0.5:24:732 RRA:AVERAGE:0.5:288:730 \
+            RRA:MAX:0.5:1:576 RRA:MAX:0.5:6:672 RRA:MAX:0.5:24:732 RRA:MAX:0.5:288:730 \
+            RRA:MIN:0.5:1:576 RRA:MIN:0.5:6:672 RRA:MIN:0.5:24:732 RRA:MIN:0.5:288:730 || {
+                log_message "ERROR" "Failed to create RRD database"
+                exit 1
+            }
+    fi
+}
+
+migrate_rrd_database() {
+    # Adds data sources introduced after the original RRD was created, without
+    # losing historical data. rrdtool tune accepts DS: definitions just like
+    # create and rewrites the file in place, preserving existing archives.
+    [ -f "$RRD_FILE" ] || return 0
+
+    local rrd_info
+    rrd_info=$(LC_ALL=C rrdtool info "$RRD_FILE" 2>/dev/null) || {
+        log_message "ERROR" "Failed to read RRD info for migration check"
+        return 1
+    }
+
+    local new_ds=()
+    if ! grep -q 'ds\[rms_offset\]' <<<"$rrd_info"; then
+        new_ds+=("DS:rms_offset:GAUGE:600:U:U")
+    fi
+    if ! grep -q 'ds\[update_interval\]' <<<"$rrd_info"; then
+        new_ds+=("DS:update_interval:GAUGE:600:0:U")
+    fi
+
+    if [ "${#new_ds[@]}" -gt 0 ]; then
+        log_message "INFO" "Migrating RRD: adding data sources -> ${new_ds[*]}"
+        LC_ALL=C rrdtool tune "$RRD_FILE" "${new_ds[@]}" || {
+            log_message "ERROR" "Failed to migrate RRD database (rrdtool tune)"
+            exit 1
+        }
+    fi
+}
+
+update_rrd_database() {
+    log_message "INFO" "Updating RRD database..."
+    UPDATE_STRING="N:$OFFSET:$FREQ:$RESID_FREQ:$SKEW:$DELAY:$DISPERSION:$STRATUM:$SYSTIME:$PKTS_RECV:$PKTS_DROP:$CMD_RECV:$CMD_DROP:$LOG_DROP:$NTS_KE_ACC:$NTS_KE_DROP:$AUTH_PKTS:$INTERLEAVED:$TS_HELD:$RMS_OFFSET:$UPDATE_INTERVAL"
+    LC_ALL=C rrdtool update "$RRD_FILE" "$UPDATE_STRING" || {
+        log_message "ERROR" "Failed to update RRD database"
+        exit 1
+    }
+}
+###################### Graph definitions ######################
+# Each graph_* function fills the global GA array with the rrdtool graph
+# arguments specific to that graph. The common options (output file, size,
+# time range) are added by generate_graphs(). Using a bash array instead of
+# building a string for eval avoids quoting/word-splitting pitfalls.
+
+graph_chrony_serverstats() {
+    local pt="$1"
+    GA=(
+        --title "Chrony Server Statistics - $pt"
+        --vertical-label "Packets/second"
+        --lower-limit 0 --rigid --units-exponent 0
+        "DEF:pkts_recv_raw=$RRD_FILE:pkts_recv:AVERAGE"
+        "DEF:pkts_drop_raw=$RRD_FILE:pkts_drop:AVERAGE"
+        "DEF:cmd_recv_raw=$RRD_FILE:cmd_recv:AVERAGE"
+        "DEF:cmd_drop_raw=$RRD_FILE:cmd_drop:AVERAGE"
+        "DEF:log_drop_raw=$RRD_FILE:log_drop:AVERAGE"
+        "DEF:nts_ke_acc_raw=$RRD_FILE:nts_ke_acc:AVERAGE"
+        "DEF:nts_ke_drop_raw=$RRD_FILE:nts_ke_drop:AVERAGE"
+        "DEF:auth_pkts_raw=$RRD_FILE:auth_pkts:AVERAGE"
+        "CDEF:pkts_recv=pkts_recv_raw,$SERVER_STATS_UPPER_LIMIT,GT,UNKN,pkts_recv_raw,IF"
+        "CDEF:pkts_drop=pkts_drop_raw,$SERVER_STATS_UPPER_LIMIT,GT,UNKN,pkts_drop_raw,IF"
+        "CDEF:cmd_recv=cmd_recv_raw,$SERVER_STATS_UPPER_LIMIT,GT,UNKN,cmd_recv_raw,IF"
+        "CDEF:cmd_drop=cmd_drop_raw,$SERVER_STATS_UPPER_LIMIT,GT,UNKN,cmd_drop_raw,IF"
+        "CDEF:log_drop=log_drop_raw,$SERVER_STATS_UPPER_LIMIT,GT,UNKN,log_drop_raw,IF"
+        "CDEF:nts_ke_acc=nts_ke_acc_raw,$SERVER_STATS_UPPER_LIMIT,GT,UNKN,nts_ke_acc_raw,IF"
+        "CDEF:nts_ke_drop=nts_ke_drop_raw,$SERVER_STATS_UPPER_LIMIT,GT,UNKN,nts_ke_drop_raw,IF"
+        "CDEF:auth_pkts=auth_pkts_raw,$SERVER_STATS_UPPER_LIMIT,GT,UNKN,auth_pkts_raw,IF"
+        "COMMENT: \l"
+        "AREA:pkts_recv#C4FFC4:Packets received            "
+        "LINE1:pkts_recv#00E000:"
+        "GPRINT:pkts_recv:LAST:Cur\: %6.2lf%s"
+        "GPRINT:pkts_recv:MIN:Min\: %6.2lf%s"
+        "GPRINT:pkts_recv:AVERAGE:Avg\: %6.2lf%s"
+        "GPRINT:pkts_recv:MAX:Max\: %6.2lf%s\l"
+        "LINE1:pkts_drop#FF8C00:Packets dropped             "
+        "GPRINT:pkts_drop:LAST:Cur\: %6.2lf%s"
+        "GPRINT:pkts_drop:MIN:Min\: %6.2lf%s"
+        "GPRINT:pkts_drop:AVERAGE:Avg\: %6.2lf%s"
+        "GPRINT:pkts_drop:MAX:Max\: %6.2lf%s\l"
+        "LINE1:cmd_recv#4169E1:Command packets received    "
+        "GPRINT:cmd_recv:LAST:Cur\: %6.2lf%s"
+        "GPRINT:cmd_recv:MIN:Min\: %6.2lf%s"
+        "GPRINT:cmd_recv:AVERAGE:Avg\: %6.2lf%s"
+        "GPRINT:cmd_recv:MAX:Max\: %6.2lf%s\l"
+        "LINE1:cmd_drop#FFD700:Command packets dropped     "
+        "GPRINT:cmd_drop:LAST:Cur\: %6.2lf%s"
+        "GPRINT:cmd_drop:MIN:Min\: %6.2lf%s"
+        "GPRINT:cmd_drop:AVERAGE:Avg\: %6.2lf%s"
+        "GPRINT:cmd_drop:MAX:Max\: %6.2lf%s\l"
+        "LINE1:log_drop#9400D3:Client log records dropped  "
+        "GPRINT:log_drop:LAST:Cur\: %6.2lf%s"
+        "GPRINT:log_drop:MIN:Min\: %6.2lf%s"
+        "GPRINT:log_drop:AVERAGE:Avg\: %6.2lf%s"
+        "GPRINT:log_drop:MAX:Max\: %6.2lf%s\l"
+        "LINE1:nts_ke_acc#8A2BE2:NTS-KE connections accepted "
+        "GPRINT:nts_ke_acc:LAST:Cur\: %6.2lf%s"
+        "GPRINT:nts_ke_acc:MIN:Min\: %6.2lf%s"
+        "GPRINT:nts_ke_acc:AVERAGE:Avg\: %6.2lf%s"
+        "GPRINT:nts_ke_acc:MAX:Max\: %6.2lf%s\l"
+        "LINE1:nts_ke_drop#9370DB:NTS-KE connections dropped  "
+        "GPRINT:nts_ke_drop:LAST:Cur\: %6.2lf%s"
+        "GPRINT:nts_ke_drop:MIN:Min\: %6.2lf%s"
+        "GPRINT:nts_ke_drop:AVERAGE:Avg\: %6.2lf%s"
+        "GPRINT:nts_ke_drop:MAX:Max\: %6.2lf%s\l"
+        "LINE1:auth_pkts#FF0000:Authenticated NTP packets   "
+        "GPRINT:auth_pkts:LAST:Cur\: %6.2lf%s"
+        "GPRINT:auth_pkts:MIN:Min\: %6.2lf%s"
+        "GPRINT:auth_pkts:AVERAGE:Avg\: %6.2lf%s"
+        "GPRINT:auth_pkts:MAX:Max\: %6.2lf%s\l"
+    )
+}
+
+graph_chrony_tracking() {
+    local pt="$1"
+    GA=(
+        --title "Chrony Dispersion + Stratum - $pt"
+        --vertical-label "seconds"
+        --right-axis "1000:0" --right-axis-label "Stratum"
+        "DEF:stratum=$RRD_FILE:stratum:AVERAGE"
+        "DEF:dispersion=$RRD_FILE:dispersion:AVERAGE"
+        "CDEF:disp_scaled=dispersion,1,*"
+        "CDEF:stratum_scaled=stratum,0.001,*"
+        "COMMENT: \l"
+        "LINE1:stratum_scaled#00ff00:Stratum            (right axis)               "
+        "GPRINT:stratum:LAST:  Cur\: %6.2lf%s"
+        "GPRINT:stratum:MIN:Min\: %6.2lf%s"
+        "GPRINT:stratum:AVERAGE:Avg\: %6.2lf%s"
+        "GPRINT:stratum:MAX:Max\: %6.2lf%s\l"
+        "LINE1:disp_scaled#9400D3:Root dispersion    [Root dispersion]          "
+        "GPRINT:disp_scaled:LAST:  Cur\: %6.2lf%s"
+        "GPRINT:disp_scaled:MIN:Min\: %6.2lf%s"
+        "GPRINT:disp_scaled:AVERAGE:Avg\: %6.2lf%s"
+        "GPRINT:disp_scaled:MAX:Max\: %6.2lf%s\l"
+    )
+}
+
+graph_chrony_offset() {
+    local pt="$1"
+    GA=(
+        --title "Chrony System Time Offset - $pt"
+        --vertical-label "seconds"
+        "DEF:offset=$RRD_FILE:offset:AVERAGE"
+        "DEF:systime=$RRD_FILE:systime:AVERAGE"
+        "DEF:rms=$RRD_FILE:rms_offset:AVERAGE"
+        "CDEF:systime_scaled=systime,1,*"
+        "CDEF:offset_ms=offset,1,*"
+        "CDEF:rms_scaled=rms,1,*"
+        "LINE2:offset_ms#00ff00:Actual Offset from NTP Source [Last Offset] "
+        "GPRINT:offset_ms:LAST:  Cur\: %7.2lf%s"
+        "GPRINT:offset_ms:MIN:Min\: %7.2lf%s"
+        "GPRINT:offset_ms:AVERAGE:Avg\: %7.2lf%s"
+        "GPRINT:offset_ms:MAX:Max\: %7.2lf%s\l"
+        "LINE1:systime_scaled#4169E1:System Clock Adjustment       [System Time] "
+        "GPRINT:systime_scaled:LAST:  Cur\: %7.2lf%s"
+        "GPRINT:systime_scaled:MIN:Min\: %7.2lf%s"
+        "GPRINT:systime_scaled:AVERAGE:Avg\: %7.2lf%s"
+        "GPRINT:systime_scaled:MAX:Max\: %7.2lf%s\l"
+        "LINE1:rms_scaled#FF8C00:Long-term Average Offset      [RMS offset]  "
+        "GPRINT:rms_scaled:LAST:  Cur\: %7.2lf%s"
+        "GPRINT:rms_scaled:MIN:Min\: %7.2lf%s"
+        "GPRINT:rms_scaled:AVERAGE:Avg\: %7.2lf%s"
+        "GPRINT:rms_scaled:MAX:Max\: %7.2lf%s\l"
+    )
+}
+
+graph_chrony_delay() {
+    local pt="$1"
+    GA=(
+        --title "Chrony Root Delay - $pt"
+        --vertical-label "seconds"
+        "DEF:delay=$RRD_FILE:delay:AVERAGE"
+        "CDEF:delay_ms=delay,1,*"
+        "LINE2:delay_ms#00ff00:Network Delay to Root Source   [Root Delay]  "
+        "GPRINT:delay_ms:LAST:Cur\: %7.2lf%s"
+        "GPRINT:delay_ms:MIN:Min\: %7.2lf%s"
+        "GPRINT:delay_ms:AVERAGE:Avg\: %7.2lf%s"
+        "GPRINT:delay_ms:MAX:Max\: %7.2lf%s\l"
+    )
+}
+
+graph_chrony_frequency() {
+    local pt="$1"
+    GA=(
+        --title "Chrony Clock Frequency Error - $pt"
+        --vertical-label "ppm"
+        "DEF:freq=$RRD_FILE:frequency:AVERAGE"
+        "DEF:resid_freq=$RRD_FILE:resid_freq:AVERAGE"
+        "CDEF:resfreq_scaled=resid_freq,100,*"
+        "CDEF:freq_scaled=freq,1,*"
+        "LINE2:freq_scaled#00ff00:Natural Clock Drift      [Frequency]         "
+        "GPRINT:freq_scaled:LAST:Cur\: %7.2lf%s"
+        "GPRINT:freq_scaled:MIN:Min\: %7.2lf%s"
+        "GPRINT:freq_scaled:AVERAGE:Avg\: %7.2lf%s"
+        "GPRINT:freq_scaled:MAX:Max\: %7.2lf%s\n"
+        "LINE1:resfreq_scaled#4169E1:Residual Drift (x100)    [Residual freq]     "
+        "GPRINT:resfreq_scaled:LAST:Cur\: %7.2lf%s"
+        "GPRINT:resfreq_scaled:MIN:Min\: %7.2lf%s"
+        "GPRINT:resfreq_scaled:AVERAGE:Avg\: %7.2lf%s"
+        "GPRINT:resfreq_scaled:MAX:Max\: %7.2lf%s\l"
+    )
+}
+
+graph_chrony_drift() {
+    local pt="$1"
+    GA=(
+        --title "Chrony Drift Margin Error - $pt"
+        --vertical-label "ppm"
+        --units-exponent 0
+        "DEF:skew_raw=$RRD_FILE:skew:AVERAGE"
+        "CDEF:skew_scaled=skew_raw,100,*"
+        "COMMENT: \l"
+        "LINE1:skew_scaled#00ff00:Estimate Drift Error Margin (x100)  [Skew]   "
+        "GPRINT:skew_scaled:LAST:Cur\: %7.2lf"
+        "GPRINT:skew_scaled:MIN:Min\: %7.2lf"
+        "GPRINT:skew_scaled:AVERAGE:Avg\: %7.2lf"
+        "GPRINT:skew_scaled:MAX:Max\: %7.2lf\l"
+    )
+}
+
+graph_chrony_update_interval() {
+    local pt="$1"
+    GA=(
+        --title "Chrony Update Interval - $pt"
+        --vertical-label "seconds"
+        --lower-limit 0 --rigid
+        "DEF:upd=$RRD_FILE:update_interval:AVERAGE"
+        "LINE2:upd#00ff00:Interval Between Clock Updates  [Update interval] "
+        "GPRINT:upd:LAST:Cur\: %7.2lf%s"
+        "GPRINT:upd:MIN:Min\: %7.2lf%s"
+        "GPRINT:upd:AVERAGE:Avg\: %7.2lf%s"
+        "GPRINT:upd:MAX:Max\: %7.2lf%s\l"
+    )
+}
+
+generate_graphs() {
+    log_message "INFO" "Generating graphs..."
+
+    declare -A time_periods=(
+        ["day"]="end-1d"
+        ["week"]="end-1w"
+        ["month"]="end-1m"
+        ["year"]="end-1y"
+    )
+
+    declare -A period_titles=(
+        ["day"]="by day"
+        ["week"]="by week"
+        ["month"]="by month"
+        ["year"]="by year"
+    )
+
+    # Fixed ordering for periods and graphs (associative arrays are unordered).
+    local periods=("day" "week" "month" "year")
+    local graph_names=(
+        "chrony_serverstats"
+        "chrony_offset"
+        "chrony_tracking"
+        "chrony_delay"
+        "chrony_frequency"
+        "chrony_drift"
+        "chrony_update_interval"
+    )
+
+    local period graph output_file
+    local GA=()
+
+    for period in "${periods[@]}"; do
+        for graph in "${graph_names[@]}"; do
+            GA=()
+            "graph_${graph}" "${period_titles[$period]}"
+            output_file="$OUTPUT_DIR/img/${graph}_${period}.png"
+
+            LC_ALL=C rrdtool graph "$output_file" \
+                --width "$WIDTH" --height "$HEIGHT" \
+                --start "${time_periods[$period]}" --end now-180s \
+                "${GA[@]}" >/dev/null || {
+                    log_message "ERROR" "Failed to generate graph: ${graph}_${period}"
+                    exit 1
+                }
+        done
+    done
+}
+generate_html() {
+    log_message "INFO" "Generating HTML report..."
+    local GENERATED_TIMESTAMP
+    GENERATED_TIMESTAMP=$(date)
+    
+    local CHRONYC_DISPLAY_OPTS=""
+    if [[ "$CHRONY_ALLOW_DNS_LOOKUP" == "no" ]]; then
+        CHRONYC_DISPLAY_OPTS=" -n"
+    fi
+    
+    local AUTO_REFRESH_META=""
+    if [[ "$AUTO_REFRESH_SECONDS" -gt 0 ]]; then
+        AUTO_REFRESH_META="    <meta http-equiv=\"refresh\" content=\"$AUTO_REFRESH_SECONDS\">"
+    fi
+    
+    cat >"$OUTPUT_DIR/$HTML_FILENAME" <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+$AUTO_REFRESH_META
+    <title>${PAGE_TITLE} - Server Status</title>
+    <style>
+        :root {
+            --primary-text: #212529;
+            --secondary-text: #6c757d;
+            --background-color: #f8f9fa;
+            --content-background: #ffffff;
+            --border-color: #787879;
+            --code-background: #e1e1e1;
+            --code-text: #000000;
+            --container-max: 1400px;
+            --font-size-base: 16px;
+        }
+$CSS_CUSTOM_ROOT
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: var(--background-color);
+            color: var(--primary-text);
+            line-height: 1.6;
+            font-size: var(--font-size-base);
+        }
+        .container {
+            max-width: var(--container-max);
+            margin: 0 auto;
+            background-color: var(--content-background);
+            padding: 20px 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.05);
+        }
+        section {
+            margin-bottom: 40px;
+        }
+        h2 {
+            font-size: 1.8em;
+            color: var(--primary-text);
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 10px;
+            margin-top: 0;
+            margin-bottom: 20px;
+        }
+        h2 a {
+            font-size: 0.8em;
+            font-weight: normal;
+            vertical-align: middle;
+            margin-left: 10px;
+        }
+        h3 {
+            font-size: 1.3em;
+            color: var(--primary-text);
+            margin-top: 25px;
+        }
+	@media (max-width: 767px) {
+            [id^="vnstat-graphs"] table,
+            [id^="vnstat-graphs"] tbody,
+            [id^="vnstat-graphs"] tr,
+            [id^="vnstat-graphs"] td {
+                display: block;
+                width: 100%;
+            }
+
+            [id^="vnstat-graphs"] td {
+                padding-left: 0;
+                padding-right: 0;
+                text-align: center;
+            }
+        }
+        .graph-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 10px;
+            text-align: center;
+        }
+        @media (min-width: 768px) {
+            .graph-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+        figure {
+            margin: 0;
+            padding: 0;
+        }
+        img {
+            max-width: 100%;
+            height: auto;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            cursor: zoom-in;
+        }
+        .lightbox-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.85);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+            cursor: zoom-out;
+        }
+        .lightbox-overlay.open {
+            display: flex;
+        }
+        .lightbox-img {
+            width: 96vw;
+            height: 94vh; 
+            object-fit: contain;
+            border: 0;
+            cursor: zoom-out;
+        }
+        pre {
+            background-color: var(--code-background);
+            color: var(--code-text);
+            padding: 10px;
+            border: 1px solid #c3bebe;
+            border-radius: 4px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-size: 0.8em;
+        }
+        footer {
+            text-align: center;
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border-color);
+            font-size: 0.9em;
+            color: var(--secondary-text);
+        }
+        
+        .tabs {
+            display: flex;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 20px;
+        }
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            background-color: var(--background-color);
+            border: 1px solid var(--border-color);
+            border-bottom: none;
+            margin-right: 2px;
+            transition: background-color 0.3s;
+        }
+        .tab:hover {
+            background-color: #e9ecef;
+        }
+        .tab.active {
+            background-color: var(--content-background);
+            border-bottom: 1px solid var(--content-background);
+            margin-bottom: -1px;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+	<main>
+            <section id="chrony-graphs">
+                <h2>Chrony Graphs <a target="_blank" href="https://chrony-project.org/doc/latest/chronyc.html#:~:text=System%20clock-,tracking,-The%20tracking%20command">[Data Legend]</a></h2>
+                
+EOF
+
+    # --- Dynamic generation of period tabs and graph grids ---
+    # Periods and graphs are enumerated here so adding one stays a single-line
+    # change and every tab automatically gets every graph.
+    {
+        local _first=1 _p _cls _g
+        printf '                <div class="tabs">\n'
+        for _p in day week month year; do
+            _cls="tab"; [ "$_first" -eq 1 ] && _cls="tab active"; _first=0
+            printf '                    <div class="%s" onclick="showTab('\''%s'\'')">%s</div>\n' \
+                "$_cls" "$_p" "${_p^}"
+        done
+        printf '                </div>\n'
+
+        _first=1
+        for _p in day week month year; do
+            _cls="tab-content"; [ "$_first" -eq 1 ] && _cls="tab-content active"; _first=0
+            printf '                <div id="%s-content" class="%s">\n' "$_p" "$_cls"
+            printf '                    <div class="graph-grid">\n'
+            for _g in serverstats offset tracking delay frequency drift update_interval; do
+                printf '                        <figure>\n'
+                printf '                            <img src="img/chrony_%s_%s.png" alt="Chrony %s graph - %s">\n' \
+                    "$_g" "$_p" "$_g" "$_p"
+                printf '                        </figure>\n'
+            done
+            printf '                    </div>\n'
+            printf '                </div>\n'
+        done
+    } >>"$OUTPUT_DIR/$HTML_FILENAME"
+
+    cat >>"$OUTPUT_DIR/$HTML_FILENAME" <<EOF
+            </section>
+EOF
+
+    if [[ "$ENABLE_NETWORK_STATS" == "yes" ]]; then
+        for iface in "${INTERFACES[@]}"; do
+            cat >>"$OUTPUT_DIR/$HTML_FILENAME" <<EOF
+
+            <section id="vnstat-graphs-${iface}">
+                <h2>vnStati Graphs - ${iface}</h2>
+                <table border="0" style="margin-left: auto; margin-right: auto;">
+                    <tbody>
+                        <tr>
+                            <td valign="top" style="padding: 0 10px;">
+                                <img src="img/vnstat_${iface}_s.png" alt="vnStat summary ${iface}"><br>
+                                <img src="img/vnstat_${iface}_d.png" alt="vnStat daily ${iface}" style="margin-top: 4px;"><br>
+                                <img src="img/vnstat_${iface}_t.png" alt="vnStat top 10 ${iface}" style="margin-top: 4px;"><br>
+                            </td>
+                            <td valign="top" style="padding: 0 10px;">
+                                <img src="img/vnstat_${iface}_h.png" alt="vnStat hourly ${iface}"><br>
+                                <img src="img/vnstat_${iface}_m.png" alt="vnStat monthly ${iface}" style="margin-top: 4px;"><br>
+                                <img src="img/vnstat_${iface}_y.png" alt="vnStat yearly ${iface}" style="margin-top: 4px;"><br>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </section>
+EOF
+        done
+    fi
+
+    cat >>"$OUTPUT_DIR/$HTML_FILENAME" <<EOF
+
+            <section id="chrony-stats">
+                <h2>Chrony - NTP Statistics</h2>
+
+                <h3>Command: <code>chronyc${CHRONYC_DISPLAY_OPTS} sources -v</code></h3>
+                <pre><code>${CHRONYC_SOURCES}</code></pre>
+
+                <h3>Command: <code>chronyc${CHRONYC_DISPLAY_OPTS} selectdata -v</code></h3>
+                <pre><code>${CHRONYC_SELECTDATA}</code></pre>
+
+                <h3>Command: <code>chronyc${CHRONYC_DISPLAY_OPTS} sourcestats -v</code></h3>
+                <pre><code>${CHRONYC_SOURCESTATS}</code></pre>
+
+                <h3>Command: <code>chronyc${CHRONYC_DISPLAY_OPTS} tracking</code></h3>
+                <pre><code>${CHRONYC_TRACKING_HTML}</code></pre>
+            </section>
+        </main>
+
+        <footer>
+            <p>Page generated on: ${GENERATED_TIMESTAMP}</p>
+EOF
+    if [[ "$GITHUB_REPO_LINK_SHOW" == "yes" ]]; then
+        cat >>"$OUTPUT_DIR/$HTML_FILENAME" <<EOF
+            <p>Made with ❤️ by TheHuman00 | <a href="https://github.com/TheHuman00/chrony-stats" target="_blank">View on GitHub</a></p>
+EOF
+    fi
+    cat >>"$OUTPUT_DIR/$HTML_FILENAME" <<EOF
+        </footer>
+    </div>
+
+    <div id="lightbox" class="lightbox-overlay" aria-hidden="true" role="dialog">
+        <img id="lightbox-img" class="lightbox-img" alt="Expanded graph">
+    </div>
+
+    <script>
+        function showTab(period) {
+            const contents = document.querySelectorAll('.tab-content');
+            contents.forEach(content => content.classList.remove('active'));
+            const tabs = document.querySelectorAll('.tab');
+            tabs.forEach(tab => tab.classList.remove('active'));
+            document.getElementById(period + '-content').classList.add('active');
+            const evt = event || window.event; // works with inline onclick
+            if (evt && evt.target) {
+                evt.target.classList.add('active');
+            }
+        }
+
+        (function enableImageLightbox() {
+            const overlay = document.getElementById('lightbox');
+            const overlayImg = document.getElementById('lightbox-img');
+            if (!overlay || !overlayImg) return;
+
+            const open = (src, alt) => {
+                overlayImg.src = src;
+                overlayImg.alt = alt || 'Expanded image';
+                overlay.classList.add('open');
+                overlay.setAttribute('aria-hidden', 'false');
+                // Prevent background scroll
+                document.body.style.overflow = 'hidden';
+            };
+            const close = () => {
+                overlay.classList.remove('open');
+                overlay.setAttribute('aria-hidden', 'true');
+                overlayImg.src = '';
+                document.body.style.overflow = '';
+            };
+
+            document.querySelectorAll('.container img').forEach(img => {
+                img.addEventListener('click', () => open(img.src, img.alt));
+            });
+            overlay.addEventListener('click', close);
+            overlayImg.addEventListener('click', close);
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape' && overlay.classList.contains('open')) close();
+            });
+        })();
+    </script>
+</body>
+</html>
+EOF
+}
+
+main() {
+    log_message "INFO" "Starting chrony-network-stats script..."
+    validate_numeric "$WIDTH" "WIDTH"
+    validate_numeric "$HEIGHT" "HEIGHT"
+    validate_numeric "$TIMEOUT_SECONDS" "TIMEOUT_SECONDS"
+    validate_numeric "$SERVER_STATS_UPPER_LIMIT" "SERVER_STATS_UPPER_LIMIT"
+    validate_numeric "$AUTO_REFRESH_SECONDS" "AUTO_REFRESH_SECONDS"
+    configure_display_preset
+    check_commands
+    setup_directories
+    generate_vnstat_images
+    collect_chrony_data
+    extract_chronyc_values
+    create_rrd_database
+    migrate_rrd_database
+    update_rrd_database
+    generate_graphs
+    generate_html
+    log_message "INFO" "HTML page and graphs generated in: $OUTPUT_DIR/$HTML_FILENAME"
+    echo "✅ Successfully generated report"
+}
+
+main
